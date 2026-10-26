@@ -1,0 +1,47 @@
+sequenceDiagram
+    autonumber
+    actor C as Cliente
+    participant OS as Order Service
+    participant ORQ as Saga Orchestrator
+    participant INV as Inventory Service
+    participant PAY as Payment Service
+    participant GW as Gateway externo
+
+    Note over C,GW: Cenário: estoque reservado, pagamento RECUSADO. A saga reverte em ordem inversa.
+
+    C->>OS: POST /orders
+    OS-->>C: 202 Accepted {orderId, sagaId}
+    OS-)ORQ: evt OrderCreated
+    ORQ-)INV: cmd ReserveStock
+    INV->>INV: Tx: reserva estoque (T2)
+    INV-)ORQ: evt StockReserved
+    ORQ->>ORQ: Estado = PAYMENT_PROCESSING
+
+    ORQ-)PAY: cmd ProcessPayment
+    PAY->>GW: POST /charges (Idempotency-Key = sagaId)
+    GW-->>PAY: 402 declined (saldo insuficiente)
+    PAY->>PAY: payment(REFUSED) + outbox
+    PAY-)ORQ: evt PaymentRefused {motivo}
+
+    rect rgb(255, 235, 235)
+    Note over ORQ,OS: INÍCIO DA COMPENSAÇÃO
+    ORQ->>ORQ: Estado = PAYMENT_FAILED -> COMPENSATING
+
+    ORQ-)INV: cmd ReleaseStock {sagaId, messageId}  [compensa T2]
+    alt Inventory processa a compensação
+        INV->>INV: Dedup + Tx: devolve quantidade ao estoque disponível
+        INV-)ORQ: evt StockReleased
+    else Erro transitório ou sem resposta
+        ORQ-)INV: reentrega com backoff exponencial + jitter
+        Note over ORQ,INV: Compensação não pode falhar de vez: retry com alerta.<br/>Esgotadas as N tentativas: mensagem vai para a DLQ<br/>e Estado = COMPENSATION_FAILED (intervenção manual).
+    end
+    ORQ->>ORQ: Estado = CANCELLING_ORDER
+
+    ORQ-)OS: cmd CancelOrder {sagaId, motivo}  [compensa T1]
+    OS->>OS: Dedup + Tx: order = CANCELLED
+    OS-)ORQ: evt OrderCancelled
+    ORQ->>ORQ: Estado = CANCELLED (saga encerrada com compensação)
+    end
+
+    C->>OS: GET /orders/{id}
+    OS-->>C: 200 {status: CANCELLED, motivo: PAYMENT_REFUSED}

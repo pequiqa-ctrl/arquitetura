@@ -1,0 +1,49 @@
+sequenceDiagram
+    autonumber
+    actor C as Cliente
+    participant OS as Order Service
+    participant ORQ as Saga Orchestrator
+    participant INV as Inventory Service
+    participant PAY as Payment Service
+    participant GW as Gateway externo
+
+    Note over C,GW: Setas sólidas (->>) = chamada síncrona. Setas abertas (-)) = mensagem assíncrona via broker.
+
+    C->>OS: POST /orders (Idempotency-Key)
+    activate OS
+    OS->>OS: Tx local: INSERT order(PENDING) + saga_instance(STARTED) + outbox(OrderCreated)
+    OS-->>C: 202 Accepted {orderId, sagaId}
+    deactivate OS
+
+    OS-)ORQ: evt OrderCreated (via outbox)
+    ORQ->>ORQ: Estado = STOCK_RESERVING (grava saga_instance + deadline)
+
+    ORQ-)INV: cmd ReserveStock {sagaId, messageId, itens}
+    activate INV
+    INV->>INV: Dedup (processed_message) + Tx: reserva estoque + outbox
+    INV-)ORQ: evt StockReserved
+    deactivate INV
+    ORQ->>ORQ: Estado = PAYMENT_PROCESSING
+
+    ORQ-)PAY: cmd ProcessPayment {sagaId, messageId, valor}
+    activate PAY
+    PAY->>PAY: Dedup + grava payment(PROCESSING)
+    PAY->>GW: POST /charges (Idempotency-Key = sagaId, timeout 3s)
+    GW-->>PAY: 200 approved
+    PAY->>PAY: payment(APPROVED) + outbox
+    PAY-)ORQ: evt PaymentApproved
+    deactivate PAY
+    ORQ->>ORQ: Estado = CONFIRMING_STOCK
+
+    ORQ-)INV: cmd ConfirmStock {sagaId, messageId}
+    INV->>INV: Dedup + Tx: reserva vira baixa definitiva
+    INV-)ORQ: evt StockConfirmed
+    ORQ->>ORQ: Estado = APPROVING_ORDER
+
+    ORQ-)OS: cmd ApproveOrder {sagaId, messageId}
+    OS->>OS: Dedup + Tx: order = APPROVED
+    OS-)ORQ: evt OrderApproved
+    ORQ->>ORQ: Estado = COMPLETED (fim da saga)
+
+    C->>OS: GET /orders/{id} (polling ou notificação)
+    OS-->>C: 200 {status: APPROVED}

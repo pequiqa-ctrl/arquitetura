@@ -1,0 +1,40 @@
+sequenceDiagram
+    autonumber
+    participant ORQ as Saga Orchestrator
+    participant INV as Inventory Service
+    participant PAY as Payment Service
+    participant GW as Gateway externo
+
+    Note over ORQ,GW: Cenário: timeout de rede no gateway. O resultado do pagamento é DESCONHECIDO.
+
+    ORQ->>ORQ: Estado = PAYMENT_PROCESSING, deadline_at = agora + 60s
+    ORQ-)PAY: cmd ProcessPayment {sagaId, messageId}
+    PAY->>GW: POST /charges (Idempotency-Key = sagaId)
+    GW--xPAY: timeout após 3s (sem resposta)
+    PAY->>PAY: payment(UNKNOWN)
+
+    loop Retry com backoff exponencial + jitter (máx. 3 tentativas)
+        PAY->>GW: POST /charges (MESMA Idempotency-Key)
+        Note right of GW: O gateway devolve o resultado original,<br/>sem cobrar duas vezes.
+    end
+
+    alt Gateway respondeu em uma das tentativas
+        GW-->>PAY: 200 approved (ou declined)
+        PAY-)ORQ: evt PaymentApproved (ou PaymentRefused)
+        Note over ORQ: Saga segue o fluxo de sucesso ou de compensação.
+    else Circuit Breaker abre / deadline estourou
+        ORQ->>ORQ: deadline_at vencido -> Estado = PAYMENT_TIMEOUT
+        Note over ORQ: NÃO libera estoque ainda.<br/>A cobrança pode ter ocorrido.
+        ORQ-)PAY: cmd CancelPayment {sagaId, messageId}
+        PAY->>GW: GET /charges?key=sagaId (consulta de status)
+        alt Cobrança existe e foi aprovada
+            PAY->>GW: POST /refunds (Idempotency-Key = sagaId-refund)
+            PAY-)ORQ: evt PaymentCancelled
+        else Cobrança não existe
+            PAY->>PAY: payment(CANCEL_REQUESTED): resposta tardia será estornada
+            PAY-)ORQ: evt PaymentCancelled
+        end
+        ORQ-)INV: cmd ReleaseStock
+        INV-)ORQ: evt StockReleased
+        ORQ->>ORQ: Estado = CANCELLING_ORDER -> CANCELLED
+    end

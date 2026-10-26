@@ -1,0 +1,26 @@
+stateDiagram-v2
+    [*] --> STARTED: OrderCreated
+    STARTED --> STOCK_RESERVING: envia ReserveStock
+
+    STOCK_RESERVING --> PAYMENT_PROCESSING: StockReserved
+    STOCK_RESERVING --> CANCELLING_ORDER: StockRejected (sem estoque)
+    STOCK_RESERVING --> COMPENSATING: deadline_at vencido (N tentativas)
+
+    PAYMENT_PROCESSING --> CONFIRMING_STOCK: PaymentApproved
+    PAYMENT_PROCESSING --> COMPENSATING: PaymentRefused
+    PAYMENT_PROCESSING --> PAYMENT_TIMEOUT: deadline_at vencido
+
+    PAYMENT_TIMEOUT --> COMPENSATING: PaymentCancelled
+
+    CONFIRMING_STOCK --> APPROVING_ORDER: StockConfirmed
+    APPROVING_ORDER --> COMPLETED: OrderApproved
+
+    COMPENSATING --> CANCELLING_ORDER: StockReleased
+    CANCELLING_ORDER --> CANCELLED: OrderCancelled
+
+    COMPENSATING --> COMPENSATION_FAILED: N tentativas esgotadas
+    CANCELLING_ORDER --> COMPENSATION_FAILED: N tentativas esgotadas
+
+    COMPLETED --> [*]
+    CANCELLED --> [*]
+    COMPENSATION_FAILED --> [*]: intervenção manual (via DLQ)

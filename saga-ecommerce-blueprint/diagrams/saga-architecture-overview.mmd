@@ -1,0 +1,47 @@
+flowchart TB
+    CL([Cliente<br/>Web / Mobile])
+    GWE[/Gateway de pagamento<br/>externo/]
+
+    subgraph ORD["Domínio Pedido"]
+        direction LR
+        OS["Order Service<br/>API REST"]
+        ORQ["Saga Orchestrator<br/>máquina de estados"]
+        ODB[("Orders DB<br/>orders · saga_instance<br/>saga_step_log · outbox")]
+        OS --- ODB
+        ORQ --- ODB
+    end
+
+    subgraph BUS["Barramento de mensageria (Kafka ou RabbitMQ)"]
+        direction LR
+        TCMD{{"Comandos<br/>cmd.inventory · cmd.payment · cmd.order"}}
+        TEVT{{"Respostas<br/>evt.inventory · evt.payment · evt.order"}}
+        DLQ[["Dead-Letter Queues"]]
+    end
+
+    subgraph INV["Domínio Estoque"]
+        direction LR
+        IS["Inventory Service"]
+        IDB[("Inventory DB<br/>stock · reservation<br/>processed_message · outbox")]
+        IS --- IDB
+    end
+
+    subgraph PAYD["Domínio Pagamento"]
+        direction LR
+        PS["Payment Service<br/>Retry + Circuit Breaker"]
+        PDB[("Payment DB<br/>payment<br/>processed_message · outbox")]
+        PS --- PDB
+    end
+
+    CL -- "POST /orders → 202 Accepted<br/>GET /orders/id" --> OS
+    OS -. "OrderCreated (outbox)" .-> ORQ
+    ORQ == "publica comandos" ==> TCMD
+    TEVT == "consome respostas" ==> ORQ
+    TCMD --> IS
+    TCMD --> PS
+    TCMD --> OS
+    IS --> TEVT
+    PS --> TEVT
+    OS --> TEVT
+    PS -- "HTTPS + Idempotency-Key<br/>timeout 3s" --> GWE
+    TCMD -. "N retries esgotados" .-> DLQ
+    TEVT -. "mensagem venenosa" .-> DLQ
